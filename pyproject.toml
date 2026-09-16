@@ -1,0 +1,9 @@
+[project]
+name = "llm-architecture-from-scratch"
+version = "0.1.0"
+description = "Implementing LLM architectures from scratch for deep understanding of modern LLM architectures"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14.0",
+]
