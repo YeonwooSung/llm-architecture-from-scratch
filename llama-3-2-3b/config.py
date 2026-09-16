@@ -6,7 +6,7 @@ from typing import Any
 
 
 @dataclass
-class LLaMA3_2_3BConfig:
+class LLaMA3_2Config:
     architectures: list[str] = field(default_factory=lambda: ["LlamaForCausalLM"])
     attention_bias: bool = False
     attention_dropout: float = 0.0
