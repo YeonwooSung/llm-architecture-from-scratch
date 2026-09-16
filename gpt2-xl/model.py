@@ -76,8 +76,19 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer('mask', self.mask)
 
     def forward(self, x):
-        #TODO
-        pass
+        batch_size, seq_len, _ = x.size()
+        q = self.w_q(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        attn_scores = attn_scores.masked_fill(self.mask[:seq_len, :seq_len] == 1, float('-inf'))
+        attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return self.w_o(attn_output)
 
 
 class GPT2XLBlock(nn.Module):
@@ -97,8 +108,20 @@ class GPT2XLBlock(nn.Module):
         self.dropout2 = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        #TODO Implement the forward pass for the GPT2XL block
-        pass
+        # Implement the forward pass for the GPT2XL block
+        residual = x
+        x = self.ln_1(x)
+        x = self.masked_self_attn(x)
+        x = self.dropout2(x)
+        x = x + residual
+
+        residual = x
+        x = self.ln_2(x)
+        x = self.ffn(x)
+        x = self.dropout2(x)
+        x = x + residual
+
+        return x
 
 
 class GPT2XL(nn.Module):
