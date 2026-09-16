@@ -40,6 +40,10 @@ class RoPE(nn.Module):
             theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
         )
 
+        # Llama 3.2 rescales low/high frequencies to extend context length beyond pretraining.
+        if config.rope_scaling is not None:
+            inv_freq = self._apply_rope_scaling(inv_freq, config.rope_scaling)
+
         # [max_seq_len]
         positions = torch.arange(self.max_seq_len, dtype=torch.float32,)
 
@@ -52,6 +56,41 @@ class RoPE(nn.Module):
 
         self.register_buffer("cos", angles.cos(), persistent=False,)
         self.register_buffer("sin", angles.sin(), persistent=False,)
+
+    @staticmethod
+    def _apply_rope_scaling(inv_freq: torch.Tensor, rope_scaling: dict) -> torch.Tensor:
+        """
+        Llama 3 "rope_type": "llama3" scaling.
+
+        Low frequencies (long wavelengths) are divided by `factor`, high
+        frequencies are left untouched, and the band in between is smoothly
+        interpolated. This lets the model extrapolate to longer context
+        lengths than it was pretrained on.
+        """
+
+        factor = rope_scaling["factor"]
+        low_freq_factor = rope_scaling["low_freq_factor"]
+        high_freq_factor = rope_scaling["high_freq_factor"]
+        old_context_len = rope_scaling["original_max_position_embeddings"]
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+
+        wavelen = 2 * math.pi / inv_freq
+
+        # wavelen < high_freq_wavelen: keep as-is. wavelen > low_freq_wavelen: divide by factor.
+        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        smoothed_inv_freq = (
+            smooth_factor * inv_freq_llama / factor + (1 - smooth_factor) * inv_freq_llama
+        )
+
+        is_medium_freq = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+
+        return torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
