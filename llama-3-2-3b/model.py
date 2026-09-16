@@ -283,9 +283,9 @@ class MaskedGroupedQueryAttention(nn.Module):
 class Llama3_2FeedForward(nn.Module):
     def __init__(self, config: LLaMA3_2Config):
         super().__init__()
-        self.linear1 = nn.Linear(config.hidden_size, config.ffn_hidden_size, bias=False)
+        self.linear1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.silu = nn.SiLU()
-        self.linear2 = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=False)
+        self.linear2 = nn.Linear(config.ffn_hidden_size, config.intermediate_size, bias=False)
         self.linear3 = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
