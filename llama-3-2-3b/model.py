@@ -1,5 +1,7 @@
+import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from config import LLaMA3_2Config
 
@@ -90,10 +92,201 @@ class RoPE(nn.Module):
         return x * cos + self._rotate_half(x) * sin
 
 
+class MaskedGroupedQueryAttention(nn.Module):
+    """
+    Grouped Query Attention used by Llama 3.
+
+    Llama 3 8B:
+        num_heads = 32
+        num_kv_heads = 8
+
+    Therefore:
+
+        4 query heads share one K/V head.
+    """
+
+    def __init__(self, config: LLaMA3_2Config):
+        super().__init__()
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+
+        self.rope = RoPE(config)
+
+        # Llama does not use bias in attention projections.
+        self.w_q = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False,)
+        self.w_k = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False,)
+        self.w_v = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False,)
+        self.w_o = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False,)
+
+    @staticmethod
+    def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Input:
+            [B, H_kv, S, D]
+
+        Output:
+            [B, H_q, S, D]
+
+        Example:
+
+            8 KV heads
+                ↓ repeat x4
+            32 attention heads
+        """
+
+        if n_rep == 1:
+            return x
+
+        batch_size, num_kv_heads, seq_len, head_dim = x.shape
+
+        x = x[:, :, None, :, :]
+        x = x.expand(batch_size, num_kv_heads, n_rep, seq_len, head_dim,)
+
+        return x.reshape(batch_size, num_kv_heads * n_rep, seq_len, head_dim,)
+
+    @staticmethod
+    def _make_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Returns:
+
+            [1, 1, S, S]
+
+        True means attention is allowed.
+        """
+
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device,)
+        mask = torch.tril(mask)
+
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def _prepare_mask(
+        self,
+        attention_mask: torch.Tensor | None,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Combines the causal mask with an optional padding mask.
+
+        Supported attention_mask forms:
+
+            [B, S]
+            [S, S]
+            [B, 1, 1, S]
+            [B, 1, S, S]
+
+        Values:
+            True / 1 = allowed
+            False / 0 = masked
+        """
+
+        causal_mask = self._make_causal_mask(seq_len, device,)
+
+        if attention_mask is None:
+            return causal_mask
+
+        attention_mask = attention_mask.to(device=device, dtype=torch.bool,)
+
+        if attention_mask.ndim == 2:
+            # Padding mask: [B, S]
+            if attention_mask.shape == (batch_size, seq_len):
+                attention_mask = attention_mask[:, None, None, :]
+
+            # Explicit attention matrix: [S, S]
+            elif attention_mask.shape == (seq_len, seq_len):
+                attention_mask = attention_mask[None, None, :, :]
+
+            else:
+                raise ValueError(
+                    f"Unsupported 2D attention mask shape: {attention_mask.shape}"
+                )
+
+        elif attention_mask.ndim != 4:
+            raise ValueError(
+                f"attention_mask must have 2 or 4 dimensions, got shape {attention_mask.shape}"
+            )
+
+        return causal_mask & attention_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        x:
+            [B, S, hidden_size]
+        """
+
+        batch_size, seq_len, _ = x.shape
+
+        # 1. Project Q, K and V
+        q = self.w_q(x)
+        k = self.w_k(x)
+        v = self.w_v(x)
+
+        # 2. Split into attention heads.
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim,)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim,)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim,)
+
+        # Convert [B, S, H, D] to [B, H, S, D]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # 3. Apply RoPE to Q and K. V does not receive positional encoding.
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # 4. Expand KV heads for GQA (each K/V head is shared by 4 query heads).
+        k = self._repeat_kv(k, self.num_kv_groups,)
+        v = self._repeat_kv(v, self.num_kv_groups,)
+
+        # q, k, v: [B, num_heads, S, head_dim]
+
+        # 5. Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1),)
+        scores = scores / math.sqrt(self.head_dim)
+
+        # 6. Causal + padding mask
+        mask = self._prepare_mask(attention_mask, batch_size, seq_len, x.device,)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min,)
+
+        # Softmax is safer in float32.
+        attn_weights = F.softmax(scores.float(), dim=-1,).to(dtype=q.dtype)
+
+        # 7. Weighted sum of values
+        output = torch.matmul(attn_weights, v,)
+
+        # [B, H, S, D] -> [B, S, H, D]
+        output = output.transpose(1, 2).contiguous()
+
+        # Merge heads: [B, S, H * D]
+        output = output.view(batch_size, seq_len, self.num_heads * self.head_dim,)
+
+        return self.w_o(output)
+
+
 class Llama3_2Layer(nn.Module):
     def __init__(self, config: LLaMA3_2Config):
         super().__init__()
-        #TODO
+        self.rmsnorm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
+        self.attention = MaskedGroupedQueryAttention(config)
+        self.rmsnorm2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
+        #TODO FeedForward
 
     def forward(self, x):
         #TODO implement the forward pass for a single Llama3.2 layer
