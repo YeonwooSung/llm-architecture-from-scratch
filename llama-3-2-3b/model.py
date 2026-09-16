@@ -280,17 +280,52 @@ class MaskedGroupedQueryAttention(nn.Module):
         return self.w_o(output)
 
 
+class Llama3_2FeedForward(nn.Module):
+    def __init__(self, config: LLaMA3_2Config):
+        super().__init__()
+        self.linear1 = nn.Linear(config.hidden_size, config.ffn_hidden_size, bias=False)
+        self.silu = nn.SiLU()
+        self.linear2 = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=False)
+        self.linear3 = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # linear1 -> SiLU
+        hidden = self.linear1(x)
+        hidden = self.silu(hidden)
+
+        # (concat) -> linear3
+        linear3_out = self.linear3(hidden)
+
+        # linear2
+        linear2_out = self.linear2(hidden)
+
+        # Combine outputs (assuming addition as the combination method)
+        output = linear2_out + linear3_out
+
+        return output
+
+
 class Llama3_2Layer(nn.Module):
     def __init__(self, config: LLaMA3_2Config):
         super().__init__()
         self.rmsnorm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
         self.attention = MaskedGroupedQueryAttention(config)
         self.rmsnorm2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
-        #TODO FeedForward
+        self.feed_forward = Llama3_2FeedForward(config)
 
     def forward(self, x):
-        #TODO implement the forward pass for a single Llama3.2 layer
-        pass
+        # Implement the forward pass for a single Llama3.2 layer
+        residual = x
+        x = self.rmsnorm1(x)
+        x = self.attention(x)
+        x = x + residual
+
+        residual = x
+        x = self.rmsnorm2(x)
+        x = self.feed_forward(x)
+        x = x + residual
+
+        return x
 
 
 class Llama3_2(nn.Module):
@@ -298,9 +333,22 @@ class Llama3_2(nn.Module):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        #TODO llama3.2 layers
-        #TODO Output layer
+        # Llama3.2 layers
+        self.layers = nn.ModuleList([Llama3_2Layer(config) for _ in range(config.num_hidden_layers)])
+
+        # Output layer
+        self.output_layer = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
 
     def forward(self, x):
-        #TODO
-        pass
+        # Forward pass through token embedding
+        x = self.token_embedding(x)
+
+        # Forward pass through Llama3.2 layers
+        for layer in self.layers:
+            x = layer(x)
+
+        # Forward pass through output layer
+        x = self.output_layer(x)
+
+        return x
