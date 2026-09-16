@@ -89,11 +89,24 @@ class RoPE(nn.Module):
 
         return x * cos + self._rotate_half(x) * sin
 
-    
-class Llama3_2(nn.Module):
-    def __init__(self):
+
+class Llama3_2Layer(nn.Module):
+    def __init__(self, config: LLaMA3_2Config):
         super().__init__()
         #TODO
+
+    def forward(self, x):
+        #TODO implement the forward pass for a single Llama3.2 layer
+        pass
+
+
+class Llama3_2(nn.Module):
+    def __init__(self, config: LLaMA3_2Config):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        #TODO llama3.2 layers
+        #TODO Output layer
 
     def forward(self, x):
         #TODO
