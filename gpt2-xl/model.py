@@ -1,7 +1,43 @@
 import torch
 import torch.nn as nn
+import math
 
 from config import GPT2XLConfig
+
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, config: GPT2XLConfig):
+        super().__init__()
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.scale = math.sqrt(self.token_embedding.embedding_dim)
+
+    def forward(self, x):
+        return self.token_embedding(x) * self.scale
+
+
+class PositionalEmbedding(nn.Module):
+    def __init__(self, config: GPT2XLConfig):
+        super().__init__()
+        self.dropout = nn.Dropout(config.dropout)
+
+        pe = torch.zeros(config.seq_len, config.n_embd)
+        pos = torch.arange(0, config.seq_len, dtype=torch.float).unsqueeze(1)
+
+        i = torch.arange(0, config.n_embd//2)
+        div_term = torch.exp(-math.log(10000)  * (2*i//config.n_embd))
+
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+
+        pe = pe.unsqueeze(0)
+        # The positional encoding values are used for model forward pass, but it is not a learnable parameter
+        # Thus, we register it as a buffer so it is saved and moved with the model, but not updated during training
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # Add the positional encoding to the input tensor and apply dropout
+        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
+        return self.dropout(x)
 
 
 class LayerNorm(nn.Module):
@@ -70,14 +106,20 @@ class GPT2XL(nn.Module):
         super().__init__()
         self.config = config
         # Initialize model layers here based on the configuration
-        #TODO token embedding
-        #TODO positional embedding
+        self.token_embedding = TokenEmbedding(config)
+        self.positional_embedding = PositionalEmbedding(config)
         self.dropout = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([GPT2XLBlock(config) for _ in range(config.num_layers)])
+        # self.blocks = nn.ModuleList([GPT2XLBlock(config) for _ in range(config.num_layers)])
+        self.gpt2xl_blocks = nn.Sequential(*[GPT2XLBlock(config) for _ in range(config.num_layers)])
         self.ln_f = LayerNorm(config)
         self.output_layer = nn.Linear(config.n_embd, config.vocab_size)
 
 
     def forward(self, x):
-        #TODO Implement the forward pass for the GPT2XL model
-        pass
+        # Implement the forward pass for the GPT2XL model
+        x = self.token_embedding(x)
+        x = self.positional_embedding(x)
+        x = self.dropout(x)
+        x = self.gpt2xl_blocks(x)
+        x = self.ln_f(x)
+        return self.output_layer(x)
