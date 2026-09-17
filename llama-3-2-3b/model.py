@@ -375,6 +375,8 @@ class Llama3_2(nn.Module):
         # Llama3.2 layers
         self.layers = nn.ModuleList([Llama3_2Layer(config) for _ in range(config.num_hidden_layers)])
 
+        # final RMSNorm before output
+        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
         # Output layer
         self.output_layer = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -386,6 +388,9 @@ class Llama3_2(nn.Module):
         # Forward pass through Llama3.2 layers
         for layer in self.layers:
             x = layer(x)
+
+        # Forward pass through final RMSNorm
+        x = self.final_rmsnorm(x)
 
         # Forward pass through output layer
         x = self.output_layer(x)
