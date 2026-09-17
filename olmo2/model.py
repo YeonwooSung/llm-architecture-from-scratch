@@ -147,13 +147,95 @@ class Olmo2MLP(nn.Module):
         return down_proj
 
 
+class Olmo2Attention(nn.Module):
+    def __init__(self, config: Olmo2Config):
+        super().__init__()
+
+        # self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+
+        self.rope = RoPE(config)
+
+        self.q_norm = nn.RMSNorm(config.num_attention_heads * self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(config.num_key_value_heads * self.head_dim, eps=config.rms_norm_eps)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #TODO
+        return x
+
+
+class Olmo2Block(nn.Module):
+    def __init__(self, config: Olmo2Config):
+        super().__init__()
+        # Multi-head attention with QKNorm
+        self.attention = Olmo2Attention(config)
+
+        # Post RMSNorm 1
+        self.post_rmsnorm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
+        # MLP
+        self.mlp = Olmo2MLP(config)
+        # Post RMSNorm 2
+        self.post_rmsnorm2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.attention(x)
+        x = self.post_rmsnorm1(x)
+        x = residual + x
+        residual = x
+        x = self.mlp(x)
+        x = self.post_rmsnorm2(x)
+        return x + residual
+
+
 class Olmo2(nn.Module):
     def __init__(self, config: Olmo2Config):
         super().__init__()
         self.config = config
+
+        # Token embedding
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        #TODO
+
+        # olmo2 blocks
+        self.blocks = nn.ModuleList([Olmo2Block(config) for _ in range(config.num_hidden_layers)])
+
+        # final RMSNorm before output
+        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps,)
+        # Output layer
+        self.output_layer = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #TODO
+        # Forward pass through token embedding
+        x = self.token_embedding(x)
+
+        # Forward pass through olmo2 blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Forward pass through final RMSNorm
+        x = self.final_rmsnorm(x)
+
+        # Forward pass through output layer
+        x = self.output_layer(x)
+
         return x
