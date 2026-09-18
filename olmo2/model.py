@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import Olmo2Config
 
@@ -17,116 +18,247 @@ class TokenEmbedding(nn.Module):
 
 class RoPE(nn.Module):
     """
-    Rotary Positional Embedding.
+    Rotary Positional Embedding for OLMo 2.
 
     Expected input shape:
         [batch_size, num_heads, seq_len, head_dim]
+
+    OLMo 2 follows the Llama-style RoPE convention:
+
+        x = [x1, x2]
+
+        rotate_half(x) = [-x2, x1]
+
+    where x1 and x2 are the first and second halves
+    of the head dimension.
     """
 
     def __init__(self, config: Olmo2Config):
         super().__init__()
 
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+
         self.max_seq_len = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
 
         if self.head_dim % 2 != 0:
-            raise ValueError(f"head_dim must be even for RoPE, got {self.head_dim}")
+            raise ValueError(
+                f"head_dim must be even for RoPE, got {self.head_dim}"
+            )
 
-        # Llama 3 uses 500,000.
-        theta = config.rope_theta
+        # ---------------------------------------------------------
+        # 1. Compute inverse frequencies
+        #
+        # inv_freq:
+        #   [head_dim / 2]
+        #
+        # Example:
+        #
+        #   head_dim = 128
+        #
+        #   -> 64 frequencies
+        #
+        # θ_i = 1 / base^(2i / head_dim)
+        # ---------------------------------------------------------
 
-        # [head_dim / 2]
         inv_freq = 1.0 / (
-            theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+            self.rope_theta
+            ** (
+                torch.arange(
+                    0,
+                    self.head_dim,
+                    2,
+                    dtype=torch.float32,
+                )
+                / self.head_dim
+            )
         )
 
-        # Llama 3.2 rescales low/high frequencies to extend context length beyond pretraining.
-        if config.rope_scaling is not None:
-            inv_freq = self._apply_rope_scaling(inv_freq, config.rope_scaling)
-
-        # [max_seq_len]
-        positions = torch.arange(self.max_seq_len, dtype=torch.float32,)
-
-        # [max_seq_len, head_dim / 2]
-        angles = torch.outer(positions, inv_freq)
-
-        # Meta-style RoPE uses adjacent pairs (x0, x1), (x2, x3), ... therefore
-        # each angle is repeated twice: [theta0, theta0, theta1, theta1, ...]
-        angles = torch.repeat_interleave(angles, repeats=2, dim=-1,)
-
-        self.register_buffer("cos", angles.cos(), persistent=False,)
-        self.register_buffer("sin", angles.sin(), persistent=False,)
-
-    @staticmethod
-    def _apply_rope_scaling(inv_freq: torch.Tensor, rope_scaling: dict) -> torch.Tensor:
-        """
-        Llama 3 "rope_type": "llama3" scaling.
-
-        Low frequencies (long wavelengths) are divided by `factor`, high
-        frequencies are left untouched, and the band in between is smoothly
-        interpolated. This lets the model extrapolate to longer context
-        lengths than it was pretrained on.
-        """
-
-        factor = rope_scaling["factor"]
-        low_freq_factor = rope_scaling["low_freq_factor"]
-        high_freq_factor = rope_scaling["high_freq_factor"]
-        old_context_len = rope_scaling["original_max_position_embeddings"]
-
-        low_freq_wavelen = old_context_len / low_freq_factor
-        high_freq_wavelen = old_context_len / high_freq_factor
-
-        wavelen = 2 * math.pi / inv_freq
-
-        # wavelen < high_freq_wavelen: keep as-is. wavelen > low_freq_wavelen: divide by factor.
-        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
-
-        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
-            high_freq_factor - low_freq_factor
-        )
-        smoothed_inv_freq = (
-            smooth_factor * inv_freq_llama / factor + (1 - smooth_factor) * inv_freq_llama
+        self.register_buffer(
+            "inv_freq",
+            inv_freq,
+            persistent=False,
         )
 
-        is_medium_freq = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+        # ---------------------------------------------------------
+        # 2. Precompute cos / sin cache
+        # ---------------------------------------------------------
 
-        return torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+        positions = torch.arange(
+            self.max_seq_len,
+            dtype=torch.float32,
+        )
+
+        # [seq_len, head_dim / 2]
+        freqs = torch.outer(
+            positions,
+            self.inv_freq,
+        )
+
+        # Llama / OLMo style:
+        #
+        # [θ0, θ1, θ2, ...]
+        #
+        # becomes
+        #
+        # [θ0, θ1, θ2, ..., θ0, θ1, θ2, ...]
+        #
+        # Shape:
+        # [seq_len, head_dim]
+        emb = torch.cat(
+            (freqs, freqs),
+            dim=-1,
+        )
+
+        self.register_buffer(
+            "cos",
+            emb.cos(),
+            persistent=False,
+        )
+
+        self.register_buffer(
+            "sin",
+            emb.sin(),
+            persistent=False,
+        )
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
         """
-        For adjacent pairs:
+        Llama / OLMo-style half rotation.
 
-            [x0, x1, x2, x3]
+        If:
+
+            x = [x1, x2]
+
+        then:
+
+            rotate_half(x) = [-x2, x1]
+
+        Example:
+
+            [a, b, c, d]
 
         becomes:
 
-            [-x1, x0, -x3, x2]
+            [-c, -d, a, b]
         """
 
-        x_even = x[..., ::2]
-        x_odd = x[..., 1::2]
+        half_dim = x.shape[-1] // 2
 
-        rotated = torch.stack((-x_odd, x_even), dim=-1,)
+        x1 = x[..., :half_dim]
+        x2 = x[..., half_dim:]
 
-        return rotated.flatten(-2)
+        return torch.cat(
+            (-x2, x1),
+            dim=-1,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        x:
-            [B, H, S, D]
+        Apply rotary positional embeddings.
+
+        Args:
+            x:
+                Tensor with shape:
+
+                    [B, H, S, D]
+
+            position_ids:
+                Optional position indices.
+
+                Shape:
+                    [B, S]
+
+                If None, positions are assumed to be:
+
+                    [0, 1, 2, ..., S - 1]
+
+        Returns:
+            Tensor with shape:
+
+                [B, H, S, D]
         """
 
         seq_len = x.size(-2)
 
-        if seq_len > self.max_seq_len:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds max_sequence_length={self.max_seq_len}"
-            )
+        if position_ids is None:
+            # -----------------------------------------------------
+            # Normal full-sequence forward
+            # -----------------------------------------------------
 
-        # [1, 1, S, D]
-        cos = self.cos[:seq_len].unsqueeze(0).unsqueeze(0).to(dtype=x.dtype)
-        sin = self.sin[:seq_len].unsqueeze(0).unsqueeze(0).to(dtype=x.dtype)
+            if seq_len > self.max_seq_len:
+                raise ValueError(
+                    f"Sequence length {seq_len} exceeds "
+                    f"max_position_embeddings={self.max_seq_len}"
+                )
+
+            # [S, D]
+            cos = self.cos[:seq_len]
+            sin = self.sin[:seq_len]
+
+            # [1, 1, S, D]
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+
+        else:
+            # -----------------------------------------------------
+            # Explicit positions
+            #
+            # Useful for KV-cache based autoregressive decoding.
+            # -----------------------------------------------------
+
+            if position_ids.max().item() >= self.max_seq_len:
+                raise ValueError(
+                    f"position_ids contains a position >= "
+                    f"max_position_embeddings={self.max_seq_len}"
+                )
+
+            # self.cos:
+            #   [max_seq_len, D]
+            #
+            # position_ids:
+            #   [B, S]
+            #
+            # result:
+            #   [B, S, D]
+
+            cos = self.cos[position_ids]
+            sin = self.sin[position_ids]
+
+            # [B, 1, S, D]
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+
+        # Match the dtype of Q / K.
+        cos = cos.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        sin = sin.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # ---------------------------------------------------------
+        # Standard rotary transformation
+        #
+        # x_rotated =
+        #
+        #   x * cos(theta)
+        #   +
+        #   rotate_half(x) * sin(theta)
+        #
+        # ---------------------------------------------------------
 
         return x * cos + self._rotate_half(x) * sin
 
@@ -151,35 +283,120 @@ class Olmo2Attention(nn.Module):
     def __init__(self, config: Olmo2Config):
         super().__init__()
 
-        # self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads,)
+
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
 
         self.rope = RoPE(config)
 
-        self.q_norm = nn.RMSNorm(config.num_attention_heads * self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(config.num_key_value_heads * self.head_dim, eps=config.rms_norm_eps)
+        # OLMo2 applies QK norm before splitting into heads.
+        self.q_norm = nn.RMSNorm(
+            config.num_attention_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+        )
+        self.k_norm = nn.RMSNorm(
+            config.num_key_value_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+        )
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #TODO
-        return x
+        """
+        Args:
+            x:
+                [batch_size, seq_len, hidden_size]
+
+        Returns:
+            [batch_size, seq_len, hidden_size]
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # Q, K, V projection
+        # Q: [B, S, num_heads * head_dim]
+        # K: [B, S, num_kv_heads * head_dim]
+        # V: [B, S, num_kv_heads * head_dim]
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # QK Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # Split into attention heads
+        # [B, S, H, D] -> [B, H, S, D]
+        q = q.view(
+            batch_size, seq_len, self.num_attention_heads, self.head_dim,
+        ).transpose(1, 2)
+        k = k.view(
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim,
+        ).transpose(1, 2)
+        v = v.view(
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim,
+        ).transpose(1, 2)
+
+        # Rotary positional embedding
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # Expand KV heads for GQA, when necessary
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(
+                self.num_key_value_groups,
+                dim=1,
+            )
+            v = v.repeat_interleave(
+                self.num_key_value_groups,
+                dim=1,
+            )
+
+        # Scaled dot-product causal attention
+        attention_output = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=True,
+            scale=self.scaling,
+        )
+
+        # attention_output:
+        # [B, num_heads, S, head_dim]
+
+        # Merge heads
+        attention_output = attention_output.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, self.num_attention_heads * self.head_dim,
+        )
+
+        return self.o_proj(attention_output)
 
 
 class Olmo2Block(nn.Module):
