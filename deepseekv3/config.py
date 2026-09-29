@@ -6,7 +6,7 @@ from typing import Any
 
 
 @dataclass
-class DeepseekV3Config:
+class DeepSeekV3Config:
     architectures: list[str] = field(default_factory=lambda: ["DeepseekV3ForCausalLM"])
     attention_bias: bool = False
     attention_dropout: float = 0.0
