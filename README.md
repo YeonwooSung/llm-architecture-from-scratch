@@ -15,4 +15,5 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 ## In progress
 
 - DeepSeek v3
-- DeepSeek R1
+- Gemma 3
+- xLSTM
