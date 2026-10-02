@@ -8,15 +8,176 @@ from config import DeepSeekV3Config
 
 
 class MultiHeadLatentAttention(nn.Module):
+    """
+    DeepSeek V3 causal attention with compressed Q/KV and decoupled RoPE.
+
+    The KV projection first produces a shared latent vector and a positional
+    key. Each attention head's non-positional key and value are then expanded
+    from that latent vector. This implementation processes a full sequence;
+    it does not keep an inference KV cache.
+    """
+
     def __init__(self, config: DeepSeekV3Config):
         super().__init__()
         self.config = config
+        if config.qk_rope_head_dim <= 0 or config.qk_rope_head_dim % 2:
+            raise ValueError("qk_rope_head_dim must be a positive even number")
+        if config.num_attention_heads <= 0 or config.kv_lora_rank <= 0:
+            raise ValueError("num_attention_heads and kv_lora_rank must be positive")
 
-        #TODO
+        self.num_heads = config.num_attention_heads
+        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.softmax_scale = self.qk_head_dim ** -0.5
+
+        # Queries optionally use a low-rank projection before expanding to heads.
+        if config.q_lora_rank > 0:
+            self.wq_a = nn.Linear(
+                config.hidden_size, config.q_lora_rank, bias=config.attention_bias
+            )
+            self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+            self.wq_b = nn.Linear(
+                config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False
+            )
+        else:
+            self.wq = nn.Linear(
+                config.hidden_size,
+                self.num_heads * self.qk_head_dim,
+                bias=config.attention_bias
+            )
+
+        # The positional key bypasses KV compression and is shared by all heads.
+        self.wkv_a = nn.Linear(
+            config.hidden_size,
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            bias=config.attention_bias
+        )
+        self.kv_norm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
+        self.wkv_b = nn.Linear(
+            config.kv_lora_rank,
+            self.num_heads * (config.qk_nope_head_dim + config.v_head_dim),
+            bias=False,
+        )
+        self.wo = nn.Linear(
+            self.num_heads * config.v_head_dim,
+            config.hidden_size,
+            bias=config.attention_bias
+        )
+
+        # Store only frequencies; positions are generated for each forward call.
+        inv_freq = 1.0 / (config.rope_theta ** (
+            torch.arange(0, config.qk_rope_head_dim, 2, dtype=torch.float32)
+            / config.qk_rope_head_dim
+        ))
+        scaling = config.rope_scaling
+        if scaling is not None:
+            if scaling.get("type") != "yarn":
+                raise ValueError("MLA currently supports YaRN RoPE scaling only")
+            factor = scaling["factor"]
+            original_length = scaling["original_max_position_embeddings"]
+            if factor <= 0 or original_length <= 0:
+                raise ValueError("YaRN factor and original length must be positive")
+            if config.max_position_embeddings > original_length:
+                dim = config.qk_rope_head_dim
+
+                def correction_dim(rotations: float) -> float:
+                    return dim * math.log(original_length / (rotations * 2 * math.pi)) / (2 * math.log(config.rope_theta))
+
+                low = max(math.floor(correction_dim(scaling["beta_fast"])), 0)
+                high = min(math.ceil(correction_dim(scaling["beta_slow"])), dim - 1)
+                if low == high:
+                    high += 0.001
+                ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low)
+                        / (high - low)).clamp(0, 1)
+                smooth = 1 - ramp
+                # YaRN blends original and stretched frequencies by dimension.
+                inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
+
+            mscale_all_dim = scaling.get("mscale_all_dim", 0)
+            if factor > 1 and mscale_all_dim:
+                mscale = 1 + 0.1 * mscale_all_dim * math.log(factor)
+                self.softmax_scale *= mscale * mscale
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+
+    def _apply_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Rotate adjacent feature pairs in the positional Q/K subspace.
+
+        Args:
+            x: Tensor shaped (batch, sequence, heads, rope_dim).
+            positions: Position indices for the sequence dimension.
+        """
+        angles = torch.outer(positions.float(), self.inv_freq)
+        cos = angles.cos().view(1, x.size(1), 1, -1)
+        sin = angles.sin().view(1, x.size(1), 1, -1)
+        pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+        rotated = torch.stack((
+            pairs[..., 0] * cos - pairs[..., 1] * sin,
+            pairs[..., 0] * sin + pairs[..., 1] * cos,
+        ), dim=-1)
+        return rotated.flatten(-2).to(x.dtype)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #TODO Implement the forward pass for the Multi-head Latent Attention module
-        pass
+        """
+        Return causal MLA output with the same (batch, sequence, hidden) shape.
+
+        All positions attend only to themselves and earlier positions. RoPE
+        starts at position zero on each call because this path has no KV cache.
+        """
+        batch_size, seq_len, _ = x.shape
+        if seq_len == 0:
+            return x.clone()
+
+        if self.config.q_lora_rank > 0:
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+        else:
+            q = self.wq(x)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split(
+            (self.config.qk_nope_head_dim, self.config.qk_rope_head_dim), dim=-1
+        )
+
+        # Expand the compressed KV latent into per-head content keys and values.
+        kv, k_pe = self.wkv_a(x).split(
+            (self.config.kv_lora_rank, self.config.qk_rope_head_dim), dim=-1
+        )
+        kv = self.wkv_b(self.kv_norm(kv))
+        kv = kv.reshape(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.config.qk_nope_head_dim + self.config.v_head_dim
+        )
+        k_nope, v = kv.split(
+            (self.config.qk_nope_head_dim, self.config.v_head_dim), dim=-1
+        )
+
+        positions = torch.arange(seq_len, device=x.device)
+        q_pe = self._apply_rope(q_pe, positions)
+        k_pe = self._apply_rope(k_pe.unsqueeze(2), positions)
+        # Only the positional slices rotate; every head shares the positional key.
+        q = torch.cat((q_nope, q_pe), dim=-1).transpose(1, 2)
+        k = torch.cat(
+            (k_nope, k_pe.expand(-1, -1, self.num_heads, -1)), dim=-1
+        ).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.softmax_scale
+        # Mask future tokens before softmax so this works for causal language modeling.
+        causal_mask = torch.ones(
+            seq_len, seq_len, device=x.device,
+            dtype=torch.bool
+        ).triu(1)
+        scores = scores.masked_fill(causal_mask, -torch.inf)
+        attention = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+        attention = F.dropout(
+            attention,
+            p=self.config.attention_dropout,
+            training=self.training
+        )
+        output = torch.matmul(attention, v).transpose(1, 2)
+        return self.wo(output.reshape(batch_size, seq_len, -1))
 
 
 class Expert(nn.Module):
