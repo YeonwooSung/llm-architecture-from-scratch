@@ -7,6 +7,8 @@ from typing import Any
 
 @dataclass
 class Gemma3TextConfig:
+    vocab_size: int = 262208
+    rms_norm_eps: float = 1e-6
     head_dim: int = 128
     hidden_size: int = 5376
     intermediate_size: int = 21504
@@ -26,6 +28,7 @@ class Gemma3TextConfig:
 
 @dataclass
 class Gemma3VisionConfig:
+    layer_norm_eps: float = 1e-6
     hidden_size: int = 1152
     image_size: int = 896
     intermediate_size: int = 4304
