@@ -12,8 +12,10 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [OlMo 2 7B](./olmo2/) | 7B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ❌ |
 | [Phi-4](./phi4/) | 14B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ❌ |
 | [DeepSeek v3](./deepseekv3/) | 671B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
+| [Gemma 3](./gemma3/) | 27B | Text + Image | RMSNorm | RoPE | Sliding window + GQA | ❌ |
 
 ## In progress
 
-- Gemma 3
 - xLSTM
+- Mistral Small 3.1
+- Llama 4 Maverick (400B)
