@@ -16,8 +16,10 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [xLSTM](./xlstm/) | 7B | Text | RMSNorm | RoPE | mLSTM | ❌ |
 | [Mistral 3.1 Small](./mistral_3_1/) | 24B | Text + Image | RMSNorm | RoPE | Sliding window + GQA | ❌ |
 | [Llama 4 Maverick](./llama4_maverick/) | 400B | Text | RMSNorm | RoPE | GQA | ✅ |
+| [Qwen3](./qwen3_32b/) | 32B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) |  ❌ |
 
 ## In progress
 
-- Qwen3 (32B)
 - Qwen3 (235B-A22B)
+- SmolLM3
+- Kimi K2 (1T)
