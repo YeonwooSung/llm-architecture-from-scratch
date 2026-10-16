@@ -18,10 +18,10 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [Llama 4 Maverick](./llama4_maverick/) | 400B | Text | RMSNorm | RoPE | GQA | ✅ |
 | [Qwen3](./qwen3_32b/) | 32B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) |  ❌ |
 | [Qwen3 (235B-A22B)](./qwen3_235b_a22b/) | 235B A22B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
+| [SmolLM3](./smollm3/) | 3B | Text | RMSNorm | RoPE + NoPE | Grouped-Query Attention (causal) |  ❌ |
 
 ## In progress
 
-- SmolLM3
 - Kimi K2 (1T)
 - GLM 4.5
 - GPT OSS 120B
