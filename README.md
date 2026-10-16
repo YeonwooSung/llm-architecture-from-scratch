@@ -23,7 +23,7 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 ## In progress
 
 - Kimi K2 (1T)
-- GLM 4.5
+- GLM 4.5 (355B)
 - GPT OSS 120B
 - Grok 2.5 (270B)
 - Qwen3 Next (80B-A3B)
