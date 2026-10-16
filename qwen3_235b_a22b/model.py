@@ -1,0 +1,274 @@
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from config import Qwen3_235B_A22BConfig
+
+
+class Qwen3MoeRMSNorm(nn.Module):
+    """Compute the variance in float32, including during mixed precision."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
+        return self.weight * normalized.to(x.dtype)
+
+
+class RoPE(nn.Module):
+    """Split-half rotary embeddings for tensors shaped [B, H, S, D]."""
+
+    def __init__(self, config: Qwen3_235B_A22BConfig):
+        super().__init__()
+        if config.head_dim <= 0 or config.head_dim % 2:
+            raise ValueError("head_dim must be a positive even number")
+        if config.rope_scaling is not None:
+            raise NotImplementedError("Only default RoPE (rope_scaling=None) is supported")
+        if config.rope_theta <= 0 or config.max_position_embeddings <= 0:
+            raise ValueError("rope_theta and max_position_embeddings must be positive")
+
+        self.head_dim = config.head_dim
+        self.max_seq_len = config.max_position_embeddings
+        # Compute only the requested positions rather than caching 40,960 rows
+        # separately in every decoder layer.
+        self.register_buffer(
+            "inv_freq",
+            config.rope_theta ** (-torch.arange(0, config.head_dim, 2).float() / config.head_dim),
+            persistent=False,
+        )
+        self.rope_theta = config.rope_theta
+
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        left, right = x.chunk(2, dim=-1)
+        return torch.cat((-right, left), dim=-1)
+
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
+        batch, _, length, _ = x.shape
+        if length > self.max_seq_len:
+            raise ValueError("Sequence exceeds max_position_embeddings")
+        if position_ids is None:
+            position_ids = torch.arange(length, device=x.device).unsqueeze(0)
+        elif position_ids.shape not in ((1, length), (batch, length)):
+            raise ValueError("position_ids must have shape [1 or batch, sequence]")
+        if position_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("position_ids must contain integer positions")
+        if (position_ids < 0).any() or (position_ids >= self.max_seq_len).any():
+            raise ValueError("position_ids must be within max_position_embeddings")
+
+        # Recompute from integer indices if model.to(dtype) rounded the buffer.
+        inv_freq = self.inv_freq
+        if inv_freq.dtype != torch.float32:
+            inv_freq = self.rope_theta ** (
+                -torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim
+            )
+        angles = position_ids.to(device=x.device, dtype=torch.float32)[..., None] * inv_freq
+        angles = torch.cat((angles, angles), dim=-1).unsqueeze(1)
+        return x * angles.cos().to(x.dtype) + self._rotate_half(x) * angles.sin().to(x.dtype)
+
+
+class Qwen3MoeMLP(nn.Module):
+    """Bias-free SwiGLU feedforward network."""
+
+    def __init__(self, config: Qwen3_235B_A22BConfig, intermediate_size: int | None = None):
+        super().__init__()
+        if config.hidden_act != "silu":
+            raise NotImplementedError("Only hidden_act='silu' is supported")
+        width = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.down_proj = nn.Linear(width, config.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen3MoeAttention(nn.Module):
+    def __init__(self, config: Qwen3_235B_A22BConfig, layer_idx: int = 0):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        if self.num_heads <= 0 or self.num_kv_heads <= 0 or self.num_heads % self.num_kv_heads:
+            raise ValueError("num_attention_heads must be a positive multiple of num_key_value_heads")
+        if not 0 <= config.attention_dropout <= 1:
+            raise ValueError("attention_dropout must be between 0 and 1")
+        self.dropout = config.attention_dropout
+        self.window = None
+        if config.use_sliding_window:
+            if config.sliding_window is None or config.sliding_window <= 0:
+                raise ValueError("use_sliding_window requires a positive sliding_window")
+            if layer_idx >= config.max_window_layers:
+                self.window = config.sliding_window
+        self.rope = RoPE(config)
+
+        # Qwen3-235B has attention width 64 * 128 = 8192, versus hidden_size 4096.
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        # Unlike OLMo2, normalize each head independently, before applying RoPE.
+        self.q_norm = Qwen3MoeRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = Qwen3MoeRMSNorm(self.head_dim, config.rms_norm_eps)
+
+
+    def forward(
+        self, x: torch.Tensor, attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, length, _ = x.shape
+
+        q = self.q_proj(x).view(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.rope(self.q_norm(q), position_ids)
+        k = self.rope(self.k_norm(k), position_ids)
+        repeats = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+
+        allowed = None
+        if attention_mask is not None or self.window is not None:
+            indices = torch.arange(length, device=x.device)
+            distance = indices[:, None] - indices[None, :]
+            allowed = (distance >= 0)[None, None]
+            if self.window is not None:
+                allowed = allowed & (distance < self.window)
+            if attention_mask is not None:
+                if attention_mask.shape != (batch, length):
+                    raise ValueError("attention_mask must have shape [batch, sequence]")
+                allowed = allowed & attention_mask.to(device=x.device, dtype=torch.bool)[:, None, None, :]
+
+        # SDPA returns zero for queries with no allowed keys (e.g. left padding).
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=allowed, is_causal=allowed is None,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        output = output.transpose(1, 2).reshape(batch, length, self.num_heads * self.head_dim)
+        return self.o_proj(output)
+
+
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    """Token-choice top-k routing over independent SwiGLU experts.
+
+    Qwen3 uses softmax scores, weights expert OUTPUTS, and has no shared expert.
+    Only experts selected by at least one token are evaluated.
+    """
+
+    def __init__(self, config: Qwen3_235B_A22BConfig):
+        super().__init__()
+        if not 1 <= config.num_experts_per_tok <= config.num_experts:
+            raise ValueError("num_experts_per_tok must be between 1 and num_experts")
+        if config.moe_intermediate_size <= 0:
+            raise ValueError("moe_intermediate_size must be positive")
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            Qwen3MoeMLP(config, config.moe_intermediate_size) for _ in range(self.num_experts)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = x.reshape(-1, x.size(-1))
+        router_logits = self.gate(tokens)
+        # Keep routing probabilities in float32 through selection/normalization.
+        probabilities = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        weights, selected = probabilities.topk(self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights.to(tokens.dtype)
+
+        output = torch.zeros_like(tokens)
+        for expert_id, expert in enumerate(self.experts):
+            token_ids, slots = torch.where(selected == expert_id)
+            if token_ids.numel() == 0:
+                continue
+            contribution = expert(tokens[token_ids]) * weights[token_ids, slots, None]
+            output = output.index_add(0, token_ids, contribution.to(output.dtype))
+        return output.reshape_as(x), router_logits
+
+
+class Qwen3MoeBlock(nn.Module):
+    def __init__(self, config: Qwen3_235B_A22BConfig, layer_idx: int = 0):
+        super().__init__()
+        if config.decoder_sparse_step <= 0:
+            raise ValueError("decoder_sparse_step must be positive")
+        if config.num_experts < 0:
+            raise ValueError("num_experts must be nonnegative")
+
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.self_attn = Qwen3MoeAttention(config, layer_idx)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.is_moe_layer = (
+            config.num_experts > 0
+            and layer_idx not in config.mlp_only_layers
+            and (layer_idx + 1) % config.decoder_sparse_step == 0
+        )
+        self.mlp = Qwen3MoeSparseMoeBlock(config) if self.is_moe_layer else Qwen3MoeMLP(config)
+
+
+    def forward(
+        self, x: torch.Tensor, attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask, position_ids)
+        result = self.mlp(self.post_attention_layernorm(x))
+        result, router_logits = result if self.is_moe_layer else (result, None)
+        return x + result, router_logits
+
+
+class Qwen3_235B_A22BModel(nn.Module):
+    def __init__(self, config: Qwen3_235B_A22BConfig):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(Qwen3MoeBlock(config, i) for i in range(config.num_hidden_layers))
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.apply(self._init_weights)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.token_embedding.weight
+
+
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if getattr(module, "bias", None) is not None:
+                nn.init.zeros_(module.bias)
+
+
+    def forward(
+        self, x: torch.Tensor, attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        output_router_logits: bool | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """
+        Return [batch, sequence, vocab] logits for [batch, sequence] token IDs.
+
+        attention_mask: [batch, sequence], 1/True for valid keys.
+        position_ids: [1 or batch, sequence]; defaults to positions starting at 0.
+
+        With output_router_logits enabled, return (logits, router_logits), where
+        the tuple contains [batch * sequence, num_experts] logits per MoE layer.
+        Padding masks affect attention only; router logits include padded tokens.
+        """
+        if x.ndim != 2 or x.size(1) == 0:
+            raise ValueError("x must have shape [batch, nonempty sequence]")
+        if x.size(1) > self.config.max_position_embeddings:
+            raise ValueError("Sequence exceeds max_position_embeddings")
+        collect_router = self.config.output_router_logits if output_router_logits is None else output_router_logits
+        x = self.token_embedding(x)
+        router_outputs = []
+        for layer in self.layers:
+            x, router_logits = layer(x, attention_mask, position_ids)
+            if collect_router and router_logits is not None:
+                router_outputs.append(router_logits)
+        logits = self.lm_head(self.norm(x))
+        return (logits, tuple(router_outputs)) if collect_router else logits
