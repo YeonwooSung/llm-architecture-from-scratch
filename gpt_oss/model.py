@@ -87,24 +87,36 @@ class GptOssAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
+
         if self.num_heads <= 0 or self.num_kv_heads <= 0 or self.num_heads % self.num_kv_heads:
             raise ValueError("num_attention_heads must be a positive multiple of num_key_value_heads")
         if not 0 <= config.attention_dropout <= 1:
             raise ValueError("attention_dropout must be between 0 and 1")
         if not 0 <= layer_idx < len(config.layer_types):
             raise ValueError("layer_types must specify each decoder layer")
+
+        # Uses sliding attention and full attention
+        # (1st layer = sliding, 2nd layer onwards = full, 3rd layer = slding, 4th layer = full, ...)
         layer_type = config.layer_types[layer_idx]
         if layer_type not in ("sliding_attention", "full_attention"):
             raise ValueError("Unsupported attention layer type")
         self.window = config.sliding_window if layer_type == "sliding_attention" else None
         if self.window is not None and self.window <= 0:
             raise ValueError("sliding_window must be positive")
+
         self.dropout = config.attention_dropout
         self.rope = RoPE(config)
+
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+
+        # A learned logit per head that absorbs probability mass but contributes no value.
+        # Basically, attention allocates probability mass to the actual keys (sum of probs should be 1).
+        # But, it is clear that the query might not always have a perfect match among the keys,
+        # so the sink absorbs the leftover probability mass.
+        # The main purpose of the sink is to reduce the impact of queries that do not have a good match among the keys.
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
 
 
@@ -132,12 +144,14 @@ class GptOssAttention(nn.Module):
 
         scores = (q.float() @ k.float().transpose(-2, -1)) * self.head_dim ** -0.5
         scores = scores.masked_fill(~allowed, -torch.inf)
-        # A learned logit per head absorbs probability mass but contributes no
-        # value. Keeping it unmasked also makes fully padded rows well-defined.
+
+        # A learned logit per head absorbs probability mass but contributes no value.
+        # Keeping it unmasked also makes fully padded rows well-defined.
         sink = self.sinks.float()[None, :, None, None].expand(batch, -1, length, 1)
         weights = F.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
         weights = F.dropout(weights, p=self.dropout, training=self.training).to(v.dtype)
         result = (weights @ v).transpose(1, 2).reshape(batch, length, self.num_heads * self.head_dim)
+
         return self.o_proj(result)
 
 
@@ -176,10 +190,15 @@ class GptOssMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = x.reshape(-1, x.size(-1))
+
+        # Compute the router logits and select the top-k experts for each token.
+        # GPT OSS allocates each token to the top-4 experts (based on the config)
         router_logits = self.router(tokens)
         selected_logits, selected = router_logits.topk(self.top_k, dim=-1)
+
         weights = F.softmax(selected_logits, dim=-1, dtype=torch.float32).to(tokens.dtype)
         output = torch.zeros_like(tokens)
+
         for expert_id, expert in enumerate(self.experts):
             token_ids, slots = torch.where(selected == expert_id)
             if token_ids.numel() == 0:
