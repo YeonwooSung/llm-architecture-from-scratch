@@ -15,15 +15,15 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [Gemma 3](./gemma3/) | 27B | Text + Image | RMSNorm | RoPE | Sliding window + GQA | ❌ |
 | [xLSTM](./xlstm/) | 7B | Text | RMSNorm | RoPE | mLSTM | ❌ |
 | [Mistral 3.1 Small](./mistral_3_1/) | 24B | Text + Image | RMSNorm | RoPE | Sliding window + GQA | ❌ |
-| [Llama 4 Maverick](./llama4_maverick/) | 400B | Text | RMSNorm | RoPE | GQA | ✅ |
+| [Llama 4 Maverick](./llama4_maverick/) | 400B | Text | RMSNorm | RoPE + NoPE | GQA | ✅ |
 | [Qwen3](./qwen3_32b/) | 32B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) |  ❌ |
 | [Qwen3 (235B-A22B)](./qwen3_235b_a22b/) | 235B A22B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 | [SmolLM3](./smollm3/) | 3B | Text | RMSNorm | RoPE + NoPE | Grouped-Query Attention (causal) |  ❌ |
 | [Kimi K2](./kimi_k2/) | 1T | Text | RMSNorm | RoPE | Multi-head Latent Attention | ✅ |
+| [GPT OSS](./gpt_oss/) | 120B | Text | RMSNorm | YaRN RoPE | Grouped-Query Attention (causal) | ✅ |
 
 ## In progress
 
 - GLM 4.5 (355B)
-- GPT OSS 120B
 - Grok 2.5 (270B)
 - Qwen3 Next (80B-A3B)
