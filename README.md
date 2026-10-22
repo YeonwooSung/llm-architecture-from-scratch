@@ -1,10 +1,6 @@
 # LLM architecture from scratch
 
-<a href="https://trendshift.io/repositories/304940" target="_blank" rel="noopener noreferrer">
-  <img src="https://trendshift.io/api/badge/repositories/304940"
-       alt="YeonwooSung/my-claude-code-mods | Trendshift"
-       width="250" height="55"/>
-</a>
+[![Trendshift](https://img.shields.io/badge/Trendshift-View%20Stats-blue)](https://trendshift.io/repositories/304940)
 
 Implementing LLM architectures from scratch for deep understanding of modern LLM architectures.
 
