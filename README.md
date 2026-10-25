@@ -31,3 +31,6 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 - Qwen3 Next (80B-A3B)
 - MiniMax M2 (230B)
 - Ouro Thinking (2.6B)
+- OLMo3 (32B)
+- DeepSeek v3.2 (671B)
+- Mistral Large 3
