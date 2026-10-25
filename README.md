@@ -29,3 +29,5 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 
 - Grok 2.5 (270B)
 - Qwen3 Next (80B-A3B)
+- MiniMax M2 (230B)
+- Ouro Thinking (2.6B)
