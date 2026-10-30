@@ -24,12 +24,12 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [Kimi K2](./kimi_k2/) | 1T | Text | RMSNorm | RoPE | Multi-head Latent Attention | ✅ |
 | [GPT OSS](./gpt_oss/) | 120B | Text | RMSNorm | YaRN RoPE | Grouped-Query Attention (causal) | ✅ |
 | [GLM 4.5](./glm4_5/) | 355B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
+| [Grok 2.5](./grok2_5/) | 270B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
+| [MiniMax M2 (230B)](./minimax_m2/) | 230B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 
 ## In progress
 
-- Grok 2.5 (270B)
 - Qwen3 Next (80B-A3B)
-- MiniMax M2 (230B)
 - Ouro Thinking (2.6B)
 - OLMo3 (32B)
 - DeepSeek v3.2 (671B)
