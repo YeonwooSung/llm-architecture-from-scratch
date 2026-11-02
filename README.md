@@ -26,10 +26,10 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [GLM 4.5](./glm4_5/) | 355B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 | [Grok 2.5](./grok2_5/) | 270B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 | [MiniMax M2 (230B)](./minimax_m2/) | 230B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
+| [Qwen3 Next](./qwen3_next/) | 80B-A3B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 
 ## In progress
 
-- Qwen3 Next (80B-A3B)
 - Ouro Thinking (2.6B)
 - OLMo3 (32B)
 - DeepSeek v3.2 (671B)
