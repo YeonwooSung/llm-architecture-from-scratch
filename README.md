@@ -29,8 +29,8 @@ Implementing LLM architectures from scratch for deep understanding of modern LLM
 | [Qwen3 Next](./qwen3_next/) | 80B-A3B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ✅ |
 | [Ouro Thinking](./ouro_thinking/) | 2.6B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ❌ |
 | [OLMo3](./olmo3/) | 32B | Text | RMSNorm | RoPE | Grouped-Query Attention (causal) | ❌ |
+| [DeepSeek v3.2](./deepseekv3_2/) | 671B | Text | RMSNorm | YaRN RoPE | Multi-head Latent Attention + DeepSeek Sparse Attention | ✅ |
 
 ## In progress
 
-- DeepSeek v3.2 (671B)
 - Mistral Large 3
